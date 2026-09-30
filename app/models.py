@@ -243,3 +243,17 @@ class BatchAckRequest(BaseModel):
         if not re.fullmatch(r"[0-9a-f]{64}", s):
             raise ValueError("batch_digest must be a 64-char lowercase hex sha256")
         return s
+
+
+class BatchArchiveRequest(BaseModel):
+    """归档设备的连续批次前缀：清空 ``1..through_sequence`` 批次的明细载荷。
+
+    目标不得超过同一事务内核定的 ``safe_sequence``（全部必需消费者水位的
+    最小值），越界返回 409 并附当前水位与阻塞消费者；重复或更小的目标幂等。
+    归档只保留墓碑（batch_id、序号、前序与本批摘要、条数、时间、首次响应、
+    重放统计），链头摘要与后续上传不变。
+    """
+
+    through_sequence: int = Field(
+        ge=1, description="归档目标序号：归档连续前缀 1..through_sequence"
+    )

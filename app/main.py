@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response
 from . import config
 from .align import AidPattern, judge
 from .db import (
+    ArchiveConflict,
     BatchConflict,
     BatchNotFound,
     ConsumerConflict,
@@ -17,6 +18,7 @@ from .db import (
 )
 from .models import (
     BatchAckRequest,
+    BatchArchiveRequest,
     BatchUploadRequest,
     ConsumerRegisterRequest,
     JudgeRequest,
@@ -42,12 +44,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "单事务校验并追加，相同载荷重放返回原结果，冲突返回 409 及期望值。"
             "多下游处理方先登记为必需消费者，再以 consumer_id/sequence/batch_digest "
             "确认批次（乱序、并发、重复安全）；设备 safe_sequence 取各消费者连续"
-            "水位最小值，给出可安全归档的连续前缀。"
+            "水位最小值，给出可安全归档的连续前缀。按 sequence 归档连续前缀："
+            "目标不超过同事务核定的 safe_sequence（越界 409 附水位与阻塞消费者），"
+            "归档清空观测与阈值、只留墓碑（摘要/条数/首次响应/重放统计保留），"
+            "已归档批次仍接受同载荷重放与正确摘要的确认。"
             "草稿上线前可创建回放报告：冻结判定水位，用草稿快照重放水位内服务端"
             "库判定并四分类（unchanged/match_gained/match_lost/winner_changed），"
             "幂等键重试返回原报告、跨版本占用返回 409，回放不写入 judgments。"
         ),
-        version="1.6.0",
+        version="1.7.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -546,6 +551,35 @@ def create_app(db_path: str | None = None) -> FastAPI:
     )
     def get_device_archive_status(device_id: str = Path(min_length=1, max_length=128)) -> dict:
         return app.state.db.get_archive_status(device_id)
+
+    @app.post(
+        "/field-devices/{device_id}/archive",
+        status_code=201,
+        summary="归档连续批次前缀：清空明细载荷，只留墓碑",
+        description=(
+            "归档目标 through_sequence 不得超过同一事务内核定的 safe_sequence"
+            "（全部必需消费者水位的最小值），越界返回 409 并附当前水位与阻塞消费者；"
+            "重复或更小的目标幂等（HTTP 200，status=already_archived）。"
+            "归档清空目标范围内批次的观测与阈值，只保留 batch_id、序号、前序与"
+            "本批摘要、条数、时间、首次响应与重放统计，墓碑标记 status=archived；"
+            "链头摘要与后续上传不变，已归档批次仍接受同载荷重放（累计重放次数）"
+            "与正确摘要的确认（幂等、不倒退水位）。"
+        ),
+    )
+    def archive_device_batches(
+        req: BatchArchiveRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, advanced = app.state.db.archive_batches(
+                device_id, req.through_sequence
+            )
+        except ArchiveConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not advanced:
+            response.status_code = 200
+        return body
 
     return app
 
