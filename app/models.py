@@ -243,3 +243,17 @@ class BatchAckRequest(BaseModel):
         if not re.fullmatch(r"[0-9a-f]{64}", s):
             raise ValueError("batch_digest must be a 64-char lowercase hex sha256")
         return s
+
+
+class ArchiveRequest(BaseModel):
+    """归档设备批次链的连续前缀。
+
+    ``through_sequence`` 为期望归档到的右端序号（含），目标必须落在同一事务
+    内核定的 ``safe_sequence`` 之内（全部必需消费者都已确认的连续前缀）；
+    越界返回 409（附当前水位与阻塞消费者）。重复或更小目标幂等，
+    ``archived_through`` 只进不退。
+    """
+
+    through_sequence: int = Field(
+        ge=1, description="归档目标序号（含）：归档连续前缀 1..through_sequence"
+    )

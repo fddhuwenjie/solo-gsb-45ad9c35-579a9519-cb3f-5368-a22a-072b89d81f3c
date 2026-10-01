@@ -28,7 +28,8 @@
 
 - ``device_consumers``：每台设备的**必需消费者**登记（注册后不可删除），
   并缓存该消费者的连续确认水位 ``watermark``（已连续确认到的最大序号，
-  初始 0）；(device_id, consumer_id) 唯一；
+  初始 0；归档之后才登记的消费者从设备 ``archived_through`` 起步）；
+  (device_id, consumer_id) 唯一；
 - ``device_batch_acks``：每个消费者对批次的**稀疏确认**（只保存已确认的
   序号与当时摘要），(device_id, consumer_id, sequence) 唯一。
 
@@ -37,6 +38,18 @@
 最新状态整体重算，不会丢失推进。设备的 ``safe_sequence`` 取所有必需
 消费者水位的最小值（无消费者或任一消费者水位为 0 时为 0）。
 
+批次归档（清除已被全部必需消费者处理的连续前缀的明细载荷）：
+
+- ``device_chains.archived_through``：已归档连续前缀的右端序号（单调不
+  退，初始 0），``archived_at`` 为最近一次归档时刻；
+- ``device_batches.archived_at`` 非空即**墓碑**：``status='archived'``，
+  ``observations`` / ``thresholds`` 明细被清空为 NULL，仅保留
+  ``batch_id``、序号、``previous_digest``、``digest``、条数、首次受理
+  时刻/响应与重放统计。归档目标必须落在同一写事务内核验的
+  ``safe_sequence`` 之内，越界抛 :class:`ArchiveConflict`（409，附当前
+  水位与阻塞消费者）；重复或更小目标幂等。已归档批次仍可按摘要接受同
+  载荷重放并累计次数，载荷变化仍返回 409；链头摘要与后续上传不变。
+
 批次提交在单个事务内完成「幂等/链头校验 → 追加记录 → 更新链头」；重放也在
 同一幂等事务内原子累加 ``replay_count`` 并刷新批次与链游标的最近事件——
 不新增批次、不推进链头、不改写首次受理响应。写锁 + BEGIN IMMEDIATE +
@@ -44,9 +57,11 @@
 
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
 并给 ``judgments`` 表补充 ``library_version`` 列；同时为旧库的批次表补充
-``replay_count`` / ``last_replayed_at`` 列、为链游标表补充最近事件三列
-（旧记录重放次数为零，最近事件回填为链头批次的受理事件）。迁移在单个事务内
-完成。
+``replay_count`` / ``last_replayed_at`` / ``archived_at`` 列（明细列改为
+可空以承载归档墓碑）、为链游标表补充最近事件三列与
+``archived_through`` / ``archived_at`` 列（旧记录重放次数为零、归档水位
+回填为 0，最近事件回填为链头批次的受理事件）。批次表补墓碑列需要
+SQLite 表重建，迁移在单个事务内完成。
 """
 from __future__ import annotations
 
@@ -102,7 +117,9 @@ CREATE TABLE IF NOT EXISTS device_chains (
     last_event_status   TEXT NOT NULL DEFAULT 'accepted'
         CHECK (last_event_status IN ('accepted', 'replayed')),
     last_event_sequence INTEGER NOT NULL DEFAULT 0,
-    last_event_at       REAL NOT NULL DEFAULT 0.0
+    last_event_at       REAL NOT NULL DEFAULT 0.0,
+    archived_through    INTEGER NOT NULL DEFAULT 0,
+    archived_at         REAL
 );
 CREATE TABLE IF NOT EXISTS device_batches (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,12 +129,14 @@ CREATE TABLE IF NOT EXISTS device_batches (
     previous_digest   TEXT NOT NULL,
     digest            TEXT NOT NULL,
     observation_count INTEGER NOT NULL,
-    thresholds        TEXT NOT NULL,
-    observations      TEXT NOT NULL,
+    thresholds        TEXT,
+    observations      TEXT,
     response          TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'accepted',
+    status            TEXT NOT NULL DEFAULT 'accepted'
+        CHECK (status IN ('accepted', 'archived')),
     replay_count      INTEGER NOT NULL DEFAULT 0,
     last_replayed_at  REAL,
+    archived_at       REAL,
     created_at        REAL NOT NULL,
     UNIQUE (device_id, sequence),
     UNIQUE (device_id, batch_id)
@@ -255,6 +274,15 @@ class BatchNotFound(Exception):
         self.sequence = sequence
 
 
+class ArchiveConflict(Exception):
+    """归档目标越过同一事务内核验的 safe_sequence（HTTP 409），detail 附水位上下文。"""
+
+    def __init__(self, *, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "archive_conflict", "message": message}
+        self.detail.update(extra)
+
+
 def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
@@ -342,56 +370,118 @@ class Database:
         self._migrate_device_tables(conn)
 
     def _migrate_device_tables(self, conn) -> None:
-        """旧库兼容：批次表补 replay_count/last_replayed_at，链表补最近事件三列。
+        """旧库兼容：批次表补重放/归档列，链表补最近事件与归档水位列。
 
-        旧记录的重放次数为零（``last_replayed_at`` 为 NULL）；链游标最近事件
-        回填为当前链头批次的受理事件，与新批次受理后的游标含义保持一致。
+        旧记录的重放次数为零（``last_replayed_at`` 为 NULL）、归档水位为 0
+        （``archived_at`` 为 NULL）；链游标最近事件回填为当前链头批次的受理
+        事件，与新批次受理后的游标含义保持一致。归档要求批次明细列
+        （``observations``/``thresholds``）可空并新增 ``archived_at`` 墓碑
+        列，旧库这两列为 NOT NULL 且无墓碑列，SQLite 不能直接放宽 NOT NULL，
+        故按官方做法在同一事务内「建新表 → 拷数据 → 删旧表 → 改名」重建
+        （(device_id, sequence) / (device_id, batch_id) 唯一约束随新表保留）。
         """
-        batch_cols = {
-            r[1] for r in conn.execute("PRAGMA table_info(device_batches)")
+        batch_info = {
+            r[1]: r for r in conn.execute("PRAGMA table_info(device_batches)")
         }
-        if "replay_count" not in batch_cols:
+        need_rebuild = bool(batch_info) and (
+            "archived_at" not in batch_info
+            or batch_info["observations"][3]  # notnull 标志（PRAGMA 第 4 列）
+            or batch_info["thresholds"][3]
+        )
+        if need_rebuild:
+            # 先把旧库能直接 ALTER 补上的列补齐，重建时随数据一起搬过去
+            if "replay_count" not in batch_info:
+                conn.execute(
+                    "ALTER TABLE device_batches ADD COLUMN "
+                    "replay_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_replayed_at" not in batch_info:
+                conn.execute(
+                    "ALTER TABLE device_batches ADD COLUMN last_replayed_at REAL"
+                )
             conn.execute(
-                "ALTER TABLE device_batches ADD COLUMN "
-                "replay_count INTEGER NOT NULL DEFAULT 0"
+                """
+                CREATE TABLE device_batches__new (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id         TEXT NOT NULL,
+                    sequence          INTEGER NOT NULL,
+                    batch_id          TEXT NOT NULL,
+                    previous_digest   TEXT NOT NULL,
+                    digest            TEXT NOT NULL,
+                    observation_count INTEGER NOT NULL,
+                    thresholds        TEXT,
+                    observations      TEXT,
+                    response          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'accepted'
+                        CHECK (status IN ('accepted', 'archived')),
+                    replay_count      INTEGER NOT NULL DEFAULT 0,
+                    last_replayed_at  REAL,
+                    archived_at       REAL,
+                    created_at        REAL NOT NULL,
+                    UNIQUE (device_id, sequence),
+                    UNIQUE (device_id, batch_id)
+                )
+                """
             )
-        if "last_replayed_at" not in batch_cols:
-            conn.execute("ALTER TABLE device_batches ADD COLUMN last_replayed_at REAL")
+            conn.execute(
+                """
+                INSERT INTO device_batches__new
+                    (id, device_id, sequence, batch_id, previous_digest, digest,
+                     observation_count, thresholds, observations, response, status,
+                     replay_count, last_replayed_at, archived_at, created_at)
+                SELECT id, device_id, sequence, batch_id, previous_digest, digest,
+                       observation_count, thresholds, observations, response, status,
+                       replay_count, last_replayed_at, NULL, created_at
+                FROM device_batches
+                """
+            )
+            conn.execute("DROP TABLE device_batches")
+            conn.execute("ALTER TABLE device_batches__new RENAME TO device_batches")
 
-        chain_cols = {
-            r[1] for r in conn.execute("PRAGMA table_info(device_chains)")
+        chain_info = {
+            r[1]: r for r in conn.execute("PRAGMA table_info(device_chains)")
         }
         migrated_chain = False
-        if "last_event_status" not in chain_cols:
-            conn.execute(
-                "ALTER TABLE device_chains ADD COLUMN "
-                "last_event_status TEXT NOT NULL DEFAULT 'accepted'"
-            )
-            migrated_chain = True
-        if "last_event_sequence" not in chain_cols:
-            conn.execute(
-                "ALTER TABLE device_chains ADD COLUMN "
-                "last_event_sequence INTEGER NOT NULL DEFAULT 0"
-            )
-            migrated_chain = True
-        if "last_event_at" not in chain_cols:
-            conn.execute(
-                "ALTER TABLE device_chains ADD COLUMN "
-                "last_event_at REAL NOT NULL DEFAULT 0.0"
-            )
-            migrated_chain = True
-        if migrated_chain:
-            # 旧链的最近事件即链头批次的首次受理：状态 accepted、序号为链头序号、
-            # 时刻取该批次的 created_at
-            conn.execute(
-                "UPDATE device_chains SET "
-                "last_event_status = 'accepted', "
-                "last_event_sequence = last_sequence, "
-                "last_event_at = COALESCE("
-                "  (SELECT b.created_at FROM device_batches b "
-                "   WHERE b.device_id = device_chains.device_id "
-                "   AND b.sequence = device_chains.last_sequence), 0.0)"
-            )
+        if chain_info:
+            if "last_event_status" not in chain_info:
+                conn.execute(
+                    "ALTER TABLE device_chains ADD COLUMN "
+                    "last_event_status TEXT NOT NULL DEFAULT 'accepted'"
+                )
+                migrated_chain = True
+            if "last_event_sequence" not in chain_info:
+                conn.execute(
+                    "ALTER TABLE device_chains ADD COLUMN "
+                    "last_event_sequence INTEGER NOT NULL DEFAULT 0"
+                )
+                migrated_chain = True
+            if "last_event_at" not in chain_info:
+                conn.execute(
+                    "ALTER TABLE device_chains ADD COLUMN "
+                    "last_event_at REAL NOT NULL DEFAULT 0.0"
+                )
+                migrated_chain = True
+            if "archived_through" not in chain_info:
+                conn.execute(
+                    "ALTER TABLE device_chains ADD COLUMN "
+                    "archived_through INTEGER NOT NULL DEFAULT 0"
+                )
+            if "archived_at" not in chain_info:
+                conn.execute(
+                    "ALTER TABLE device_chains ADD COLUMN archived_at REAL"
+                )
+            if migrated_chain:
+                # 旧链的最近事件即链头批次的首次受理：状态 accepted、序号为链头序号、
+                # 时刻取该批次的 created_at
+                conn.execute(
+                    "UPDATE device_chains SET "
+                    "last_event_status = 'accepted', "
+                    "last_event_sequence = last_sequence, "
+                    "last_event_at = COALESCE("
+                    "  (SELECT b.created_at FROM device_batches b "
+                    "   WHERE b.device_id = device_chains.device_id "
+                    "   AND b.sequence = device_chains.last_sequence), 0.0)"
+                )
 
     # ---------------- 特征库版本 ----------------
 
@@ -815,6 +905,8 @@ class Database:
                 "last_event_status": None,
                 "last_event_sequence": 0,
                 "last_event_at": None,
+                "archived_through": 0,
+                "archived_at": None,
             }
         return {
             "device_id": device_id,
@@ -827,6 +919,8 @@ class Database:
             "last_event_status": chain["last_event_status"],
             "last_event_sequence": chain["last_event_sequence"],
             "last_event_at": _iso(chain["last_event_at"]),
+            "archived_through": chain["archived_through"],
+            "archived_at": _iso(chain["archived_at"]),
         }
 
     def list_device_batches(
@@ -834,42 +928,59 @@ class Database:
     ) -> dict:
         """按 sequence 游标分页列出设备批次（升序）。
 
-        每条返回首次受理事实 ``status='accepted'`` 及与详情一致的
-        ``replay_count`` / ``last_replayed_at``。
+        每条返回首次受理事实 ``status='accepted'``（归档墓碑为
+        ``'archived'``，不带明细）及与详情一致的
+        ``replay_count`` / ``last_replayed_at``；页顶另返回设备当前
+        ``archived_through``。
         """
         with closing(self._connect()) as conn:
+            chain = conn.execute(
+                "SELECT archived_through, archived_at FROM device_chains "
+                "WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
             rows = conn.execute(
                 "SELECT sequence, batch_id, previous_digest, digest, "
-                "observation_count, status, replay_count, last_replayed_at, created_at "
+                "observation_count, status, replay_count, last_replayed_at, "
+                "archived_at, created_at "
                 "FROM device_batches "
                 "WHERE device_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
                 (device_id, after_sequence, limit + 1),
             ).fetchall()
+        archived_through = chain["archived_through"] if chain is not None else 0
         has_more = len(rows) > limit
         rows = rows[:limit]
-        items = [
-            {
+        items = []
+        for r in rows:
+            item = {
                 "sequence": r["sequence"],
                 "batch_id": r["batch_id"],
                 "previous_digest": r["previous_digest"],
                 "digest": r["digest"],
                 "observation_count": r["observation_count"],
                 "status": r["status"],
+                "archived": r["archived_at"] is not None,
                 "replay_count": r["replay_count"],
                 "last_replayed_at": _iso(r["last_replayed_at"]),
+                "archived_at": _iso(r["archived_at"]),
                 "created_at": _iso(r["created_at"]),
             }
-            for r in rows
-        ]
+            items.append(item)
         return {
             "device_id": device_id,
             "count": len(items),
+            "archived_through": archived_through,
             "batches": items,
             "next_cursor": items[-1]["sequence"] if has_more and items else None,
         }
 
     def get_device_batch(self, device_id: str, sequence: int) -> dict | None:
-        """单条批次详情：观测时间戳、/judge 四项阈值、摘要、首次受理状态与重放信息。"""
+        """单条批次详情：摘要、条数、首次受理状态与重放信息。
+
+        未归档批次另含观测时间戳与 /judge 四项阈值；已归档批次为墓碑
+        （``status='archived'``、``archived=true``），明细已清空，
+        ``observations`` / ``thresholds`` 为 ``None``。
+        """
         with closing(self._connect()) as conn:
             r = conn.execute(
                 "SELECT * FROM device_batches WHERE device_id = ? AND sequence = ?",
@@ -877,18 +988,22 @@ class Database:
             ).fetchone()
         if r is None:
             return None
+        archived = r["archived_at"] is not None
         return {
             "status": r["status"],
+            "archived": archived,
             "replay_count": r["replay_count"],
             "last_replayed_at": _iso(r["last_replayed_at"]),
+            "archived_at": _iso(r["archived_at"]),
             "device_id": r["device_id"],
             "sequence": r["sequence"],
             "batch_id": r["batch_id"],
             "digest": r["digest"],
             "previous_digest": r["previous_digest"],
             "observation_count": r["observation_count"],
-            "observations": json.loads(r["observations"]),
-            "thresholds": json.loads(r["thresholds"]),
+            # 墓碑明细载荷已清空：观测与阈值不再返回
+            "observations": None if archived else json.loads(r["observations"]),
+            "thresholds": None if archived else json.loads(r["thresholds"]),
             "created_at": _iso(r["created_at"]),
         }
 
@@ -899,7 +1014,9 @@ class Database:
 
         同一 ``(device_id, consumer_id)`` 重复登记幂等：返回既有登记信息并以
         ``created=False`` 标记。新登记 ``created=True``。设备本身无需预先存在
-        （消费者可在任何批次上传之前登记）。
+        （消费者可在任何批次上传之前登记）。在设备已有归档前缀之后登记的消费
+        者，其水位从 ``archived_through`` 起步——这些批次的明细已被清除，
+        无需也无法再逐个确认，其首个缺口直接指向归档前缀的下一批。
         """
         now = time.time()
         with self._write_tx() as conn:
@@ -908,24 +1025,32 @@ class Database:
                 "WHERE device_id = ? AND consumer_id = ?",
                 (device_id, consumer_id),
             ).fetchone()
+            chain = conn.execute(
+                "SELECT archived_through, archived_at FROM device_chains "
+                "WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            archived_through = chain["archived_through"] if chain is not None else 0
             if existing is not None:
                 return {
                     "status": "already_registered",
                     "device_id": device_id,
                     "consumer_id": consumer_id,
                     "watermark": existing["watermark"],
+                    "archived_through": archived_through,
                     "registered_at": _iso(existing["registered_at"]),
                 }, False
             conn.execute(
                 "INSERT INTO device_consumers (device_id, consumer_id, watermark, registered_at) "
-                "VALUES (?, ?, 0, ?)",
-                (device_id, consumer_id, now),
+                "VALUES (?, ?, ?, ?)",
+                (device_id, consumer_id, archived_through, now),
             )
             return {
                 "status": "registered",
                 "device_id": device_id,
                 "consumer_id": consumer_id,
-                "watermark": 0,
+                "watermark": archived_through,
+                "archived_through": archived_through,
                 "registered_at": _iso(now),
             }, True
 
@@ -1064,6 +1189,26 @@ class Database:
                     (watermark, consumer["id"]),
                 )
 
+            # 在同一事务内基于最新稀疏确认把水位推进至首个缺口：
+            # 从当前水位 + 1 起，连续存在的确认序号逐个越过，遇到缺口即停。
+            # 归档之后登记的消费者水位从 archived_through 起步，其首个缺口
+            # 即归档前缀的下一批；归档区间内无需也无法再逐个确认。
+            watermark = consumer["watermark"]
+            while True:
+                nxt = conn.execute(
+                    "SELECT 1 FROM device_batch_acks "
+                    "WHERE device_id = ? AND consumer_id = ? AND sequence = ?",
+                    (device_id, consumer_id, watermark + 1),
+                ).fetchone()
+                if nxt is None:
+                    break
+                watermark += 1
+            if watermark != consumer["watermark"]:
+                conn.execute(
+                    "UPDATE device_consumers SET watermark = ? WHERE id = ?",
+                    (watermark, consumer["id"]),
+                )
+
             confirmed_at = _iso(now if existing is None else existing["confirmed_at"])
             body = {
                 "status": "confirmed" if created else "duplicate",
@@ -1074,42 +1219,193 @@ class Database:
                 "watermark": watermark,
                 "confirmed_at": confirmed_at,
             }
-        body["safe_sequence"] = self.get_archive_status(device_id)["safe_sequence"]
-        return body, created
+            # safe_sequence / archived_through 在同一写事务内读出，
+            # 与本次确认的水位推进严格同快照
+            body.update(self._archive_status_fields(conn, device_id))
+            return body, created
 
-    def get_archive_status(self, device_id: str) -> dict:
-        """设备的多消费者归档状态：各水位、首个缺口与阻塞消费者。
+    @staticmethod
+    def _archive_status_fields(conn, device_id: str) -> dict:
+        """在给定连接（可为写事务中的连接）内核验并组装归档水位字段。
 
         ``safe_sequence`` 取所有必需消费者水位的最小值；尚无消费者或任一消费
-        者尚未确认任何批次时为 0。``first_gap`` 为安全前缀之后的首个待归档
-        序号（``safe_sequence + 1``）；``blocking_consumers`` 列出水位等于该
-        最小值且尚未追平链头的消费者（空列表表示链上批次已全部可安全归档）。
-        不删除任何原批次。
+        者水位仍为 0 时为 0。``archived_through`` 取链游标上的已归档前缀右端
+        （单调不退，初始 0）。``blocking_consumers`` 列出水位等于该最小值且
+        尚未追平链头的消费者（空列表表示链上批次已全部可安全归档）。
         """
-        with closing(self._connect()) as conn:
-            chain = conn.execute(
-                "SELECT last_sequence FROM device_chains WHERE device_id = ?",
-                (device_id,),
-            ).fetchone()
-            head_sequence = chain["last_sequence"] if chain is not None else 0
-            statuses = self._consumer_statuses(conn, device_id, head_sequence)
-
+        chain = conn.execute(
+            "SELECT last_sequence, archived_through FROM device_chains "
+            "WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        head_sequence = chain["last_sequence"] if chain is not None else 0
+        archived_through = chain["archived_through"] if chain is not None else 0
+        statuses = Database._consumer_statuses(conn, device_id, head_sequence)
         if not statuses:
             safe_sequence = 0
             blocking: list[str] = []
         else:
             safe_sequence = min(s["watermark"] for s in statuses)
-            blocking = sorted(
-                s["consumer_id"] for s in statuses if s["watermark"] == safe_sequence
-            ) if safe_sequence < head_sequence else []
+            blocking = (
+                sorted(
+                    s["consumer_id"]
+                    for s in statuses
+                    if s["watermark"] == safe_sequence
+                )
+                if safe_sequence < head_sequence
+                else []
+            )
         return {
-            "device_id": device_id,
             "head_sequence": head_sequence,
             "consumer_count": len(statuses),
             "safe_sequence": safe_sequence,
             "first_gap": safe_sequence + 1,
             "blocking_consumers": blocking,
             "consumers": statuses,
+            "archived_through": archived_through,
+        }
+
+    def get_archive_status(self, device_id: str) -> dict:
+        """设备的多消费者归档状态：各水位、首个缺口、阻塞消费者与归档前缀。"""
+        with closing(self._connect()) as conn:
+            status = self._archive_status_fields(conn, device_id)
+            archived_at = conn.execute(
+                "SELECT archived_at FROM device_chains WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+        status["device_id"] = device_id
+        status["archived_at"] = (
+            _iso(archived_at["archived_at"]) if archived_at is not None else None
+        )
+        # 顶层字段顺序稳定：device_id 在最前
+        return {
+            "device_id": device_id,
+            "head_sequence": status["head_sequence"],
+            "consumer_count": status["consumer_count"],
+            "safe_sequence": status["safe_sequence"],
+            "first_gap": status["first_gap"],
+            "blocking_consumers": status["blocking_consumers"],
+            "consumers": status["consumers"],
+            "archived_through": status["archived_through"],
+            "archived_at": status["archived_at"],
+        }
+
+    def archive_device_prefix(self, device_id: str, through_sequence: int) -> tuple[dict, bool]:
+        """归档连续前缀 ``1..through_sequence`` 的明细载荷（单事务）。
+
+        目标不得越过**同一写事务内**核定的 ``safe_sequence``（全部必需消费者
+        都已确认的连续前缀）；越界抛 :class:`ArchiveConflict`（HTTP 409），
+        detail 携带当前 ``safe_sequence`` / ``archived_through`` /
+        ``head_sequence`` / ``first_gap`` 与阻塞消费者。归档把目标范围内批次
+        的 ``observations`` / ``thresholds`` 清空并置墓碑
+        （``status='archived'``、``archived_at``），只保留 ``batch_id``、
+        序号、前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与
+        后续上传不变。
+
+        目标不超过已归档前缀时**幂等**（HTTP 200，``status=already_archived``，
+        不刷新归档时刻、不改动重放统计）；新扩大前缀 HTTP 201
+        （``status=archived``）。写锁 + BEGIN IMMEDIATE 与确认/登记/上传共用
+        同一串行点：并发确认、消费者登记与归档互不越过未确认批次，
+        ``archived_through`` 只进不退。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            chain = conn.execute(
+                "SELECT * FROM device_chains WHERE device_id = ?", (device_id,)
+            ).fetchone()
+            head_sequence = chain["last_sequence"] if chain is not None else 0
+            archived_through = chain["archived_through"] if chain is not None else 0
+            fields = self._archive_status_fields(conn, device_id)
+            safe_sequence = fields["safe_sequence"]
+
+            if through_sequence <= archived_through:
+                # 重复或更小目标：幂等返回当前归档状态，不刷新 archived_at
+                return self._archive_response(
+                    device_id,
+                    status="already_archived",
+                    requested=through_sequence,
+                    archived_through=archived_through,
+                    archived_at=chain["archived_at"] if chain is not None else None,
+                    fields=fields,
+                ), False
+
+            if through_sequence > safe_sequence:
+                raise ArchiveConflict(
+                    message=(
+                        f"cannot archive through sequence {through_sequence}: it exceeds "
+                        f"safe_sequence {safe_sequence} (all required consumers must "
+                        f"acknowledge the contiguous prefix first)"
+                    ),
+                    reason="beyond_safe_sequence",
+                    requested_through=through_sequence,
+                    safe_sequence=safe_sequence,
+                    archived_through=archived_through,
+                    head_sequence=head_sequence,
+                    first_gap=fields["first_gap"],
+                    blocking_consumers=fields["blocking_consumers"],
+                )
+
+            # 通过 <= safe_sequence 保证目标范围内每个批次都存在
+            # （1..safe_sequence 必为已上传的连续前缀）。
+            cur = conn.execute(
+                "UPDATE device_batches SET "
+                "observations = NULL, thresholds = NULL, "
+                "status = 'archived', archived_at = ? "
+                "WHERE device_id = ? AND sequence > ? AND sequence <= ?",
+                (now, device_id, archived_through, through_sequence),
+            )
+            archived_count = cur.rowcount
+            if chain is None:
+                # 极端情况下无链行（安全水位必为 0，目标 >=1 不可能走到这里；
+                # 兜底插入，保持 archived_through 与实际墓碑一致）
+                conn.execute(
+                    "INSERT INTO device_chains "
+                    "(device_id, last_sequence, head_digest, batch_count, updated_at, "
+                    "archived_through, archived_at) "
+                    "VALUES (?, 0, '', 0, ?, ?, ?)",
+                    (device_id, now, through_sequence, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE device_chains SET archived_through = ?, archived_at = ? "
+                    "WHERE device_id = ?",
+                    (through_sequence, now, device_id),
+                )
+            fields = self._archive_status_fields(conn, device_id)
+            body = self._archive_response(
+                device_id,
+                status="archived",
+                requested=through_sequence,
+                archived_through=through_sequence,
+                archived_at=now,
+                fields=fields,
+                archived_count=archived_count,
+            )
+            return body, True
+
+    @staticmethod
+    def _archive_response(
+        device_id: str,
+        *,
+        status: str,
+        requested: int,
+        archived_through: int,
+        archived_at: float | None,
+        fields: dict,
+        archived_count: int = 0,
+    ) -> dict:
+        return {
+            "status": status,
+            "device_id": device_id,
+            "requested_through": requested,
+            "archived_through": archived_through,
+            "archived_at": _iso(archived_at),
+            "newly_archived_count": archived_count,
+            "head_sequence": fields["head_sequence"],
+            "safe_sequence": fields["safe_sequence"],
+            "first_gap": fields["safe_sequence"] + 1,
+            "blocking_consumers": fields["blocking_consumers"],
+            "consumers": fields["consumers"],
         }
 
     # ---------------- 草稿回放报告 ----------------

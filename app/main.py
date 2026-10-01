@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response
 from . import config
 from .align import AidPattern, judge
 from .db import (
+    ArchiveConflict,
     BatchConflict,
     BatchNotFound,
     ConsumerConflict,
@@ -16,6 +17,7 @@ from .db import (
     VersionStateError,
 )
 from .models import (
+    ArchiveRequest,
     BatchAckRequest,
     BatchUploadRequest,
     ConsumerRegisterRequest,
@@ -43,11 +45,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "多下游处理方先登记为必需消费者，再以 consumer_id/sequence/batch_digest "
             "确认批次（乱序、并发、重复安全）；设备 safe_sequence 取各消费者连续"
             "水位最小值，给出可安全归档的连续前缀。"
+            "设备可按 sequence 归档不超过 safe_sequence 的连续前缀：清空观测与"
+            "阈值明细、保留摘要/条数/首次受理响应/重放统计为墓碑（archived），"
+            "越界 409 并附当前水位与阻塞消费者，重复目标幂等；已归档批次仍可"
+            "按摘要重放，新消费者从 archived_through 起步。"
             "草稿上线前可创建回放报告：冻结判定水位，用草稿快照重放水位内服务端"
             "库判定并四分类（unchanged/match_gained/match_lost/winner_changed），"
             "幂等键重试返回原报告、跨版本占用返回 409，回放不写入 judgments。"
         ),
-        version="1.6.0",
+        version="1.7.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -542,10 +548,40 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get(
         "/field-devices/{device_id}/archive-status",
-        summary="查询设备安全归档水位（各消费者水位、首个缺口与阻塞消费者）",
+        summary="查询设备安全归档水位（各消费者水位、首个缺口、阻塞消费者与归档前缀）",
     )
     def get_device_archive_status(device_id: str = Path(min_length=1, max_length=128)) -> dict:
         return app.state.db.get_archive_status(device_id)
+
+    @app.post(
+        "/field-devices/{device_id}/archive",
+        status_code=201,
+        summary="归档设备批次链的连续前缀（清除已被全部必需消费者处理的明细载荷）",
+        description=(
+            "按 through_sequence 归档连续前缀 1..through_sequence：目标不得超过"
+            "同一写事务内核验的 safe_sequence，越界返回 409 并附当前 safe_sequence、"
+            "archived_through、首个缺口与阻塞消费者。归档清空目标范围的观测与"
+            "阈值明细，批次成为墓碑（status=archived），只保留 batch_id、序号、"
+            "前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与后续"
+            "上传不变。重复或更小目标幂等（HTTP 200，status=already_archived）。"
+            "与并发确认、消费者登记共用同一写锁串行点：不越过未确认批次，"
+            "archived_through 只进不退。"
+        ),
+    )
+    def archive_device_batches(
+        req: ArchiveRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.archive_device_prefix(
+                device_id, req.through_sequence
+            )
+        except ArchiveConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
 
     return app
 

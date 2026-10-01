@@ -42,6 +42,15 @@
 **可安全归档的连续前缀**（尚无消费者或任一消费者未确认任何批次时为 0）。
 状态接口列出各消费者水位、首个缺口与阻塞消费者；确认只追加记录，**不删除原批次**。
 
+设备可调用 `POST /field-devices/{device_id}/archive` 按 `through_sequence`
+归档**连续前缀**：目标不得超过同一写事务内核验的 `safe_sequence`，越界返回
+409 并附当前水位与阻塞消费者。归档清空目标范围批次的观测与阈值明细，批次成为
+**墓碑**（`status=archived`），只保留 `batch_id`、序号、前序/本批摘要、条数、
+首次受理时刻/响应与重放统计；链头摘要与后续上传不变。重复或更小目标幂等，
+`archived_through` 只进不退。已归档批次仍可按摘要接受**同载荷重放**并累计重放
+次数（载荷变化仍 409）；归档之后登记的新消费者从 `archived_through` 起步，
+其首个缺口直接指向归档前缀的下一批。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -94,10 +103,11 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/batches` | 上传设备观测批次：链式追加、只保存不判定；重放返回原结果，冲突 409 |
 | `GET` | `/field-devices/{device_id}/cursor` | 查询设备批次链游标（链头摘要、下一批期望值与最近事件状态/序号/时刻） |
 | `GET` | `/field-devices/{device_id}/batches` | 按 `after_sequence` 游标分页列出设备批次（首次受理状态 + 重放计数） |
-| `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（观测时间戳、`/judge` 四项阈值与重放计数） |
-| `POST` | `/field-devices/{device_id}/consumers` | 登记设备的必需下游消费者（不可删除；重复登记幂等） |
+| `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（未归档：观测时间戳与 `/judge` 四项阈值；已归档：墓碑骨架，明细为 `null`） |
+| `POST` | `/field-devices/{device_id}/consumers` | 登记设备的必需下游消费者（不可删除；重复登记幂等；归档后登记从 `archived_through` 起步） |
 | `POST` | `/field-devices/{device_id}/acknowledgments` | 消费者确认已处理批次（`consumer_id`/`sequence`/`batch_digest`；乱序/并发/重复安全，冲突 409） |
-| `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、首个缺口、各消费者水位与阻塞消费者 |
+| `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、`archived_through`、首个缺口、各消费者水位与阻塞消费者 |
+| `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence`，越界 409；重复/更小目标幂等） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -294,10 +304,13 @@ curl -s "$BASE/changes?include_skipped=true"
 **首次迁移**：服务启动时若发现旧版平铺 `aids` 表，会在单个事务内将其整体
 转为初始激活版本（`version_id=1`，`source="migration"`）并补充判定记录的
 `library_version` 列；同时为旧版设备批次表补充 `replay_count` /
-`last_replayed_at` 列（既有批次重放次数为零、`last_replayed_at` 为空）、
-为设备链游标表补充 `last_event_status` / `last_event_sequence` /
-`last_event_at` 列（回填为链头批次的受理事件）。全新部署则无初始版本，首次
-`/library/import` 即创建版本 1。
+`last_replayed_at` / `archived_at` 列（既有批次重放次数为零、
+`last_replayed_at` 为空、未归档；明细列放宽为可空以承载归档墓碑，旧库经
+「建新表 → 拷数据 → 改名」在单事务内重建，唯一约束保留）、为设备链游标表
+补充 `last_event_status` / `last_event_sequence` / `last_event_at` 列
+（回填为链头批次的受理事件）与 `archived_through` / `archived_at` 列
+（回填为 0 / 空）。全新部署则无初始版本，首次 `/library/import` 即创建
+版本 1。
 
 ### 3. 判定观测序列
 
@@ -534,11 +547,13 @@ curl -s -X POST http://localhost:8000/field-devices/dev-01/batches \
 
 ```bash
 # 分页列出批次（after_sequence 为上一页响应的 next_cursor）
-# 每条批次带 status（首次受理事实，恒为 accepted）、replay_count、last_replayed_at
+# 页顶带 archived_through；每条批次带 status（accepted/archived 墓碑）、
+# replay_count、last_replayed_at
 curl -s "http://localhost:8000/field-devices/dev-01/batches?limit=2"
 curl -s "http://localhost:8000/field-devices/dev-01/batches?after_sequence=2&limit=2"
 
-# 单条批次详情：观测时间戳、/judge 四项阈值与重放计数
+# 单条批次详情：未归档时返回观测时间戳、/judge 四项阈值与重放计数；
+# 已归档时为墓碑（status=archived、archived=true），observations/thresholds 为 null
 curl -s http://localhost:8000/field-devices/dev-01/batches/2
 ```
 
@@ -578,7 +593,8 @@ DEV=http://localhost:8000/field-devices/dev-01
 # ① 登记两个必需消费者（登记后不可删除；重复登记幂等）
 curl -s -X POST $DEV/consumers -H 'Content-Type: application/json' \
   -d '{"consumer_id": "archiver"}'
-# → 201 {"status": "registered", "consumer_id": "archiver", "watermark": 0, ...}
+# → 201 {"status": "registered", "consumer_id": "archiver", "watermark": 0,
+#        "archived_through": 0, ...}
 curl -s -X POST $DEV/consumers -H 'Content-Type: application/json' \
   -d '{"consumer_id": "ml-pipeline"}'
 
@@ -590,10 +606,12 @@ D1=…; D2=…
 #    乱序也安全：archiver 先确认 seq2 不会推进水位（seq1 是缺口）
 curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
   -d "{\"consumer_id\": \"archiver\", \"sequence\": 2, \"batch_digest\": \"$D2\"}"
-# → 201 {"status": "confirmed", "watermark": 0, "safe_sequence": 0, ...}
+# → 201 {"status": "confirmed", "watermark": 0, "safe_sequence": 0,
+#        "archived_through": 0, ...}
 curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
   -d "{\"consumer_id\": \"archiver\", \"sequence\": 1, \"batch_digest\": \"$D1\"}"
-# → 201 {"status": "confirmed", "watermark": 2, "safe_sequence": 0, ...}
+# → 201 {"status": "confirmed", "watermark": 2, "safe_sequence": 0,
+#        "archived_through": 0, ...}
 #    archiver 已到 2，但 ml-pipeline 尚未确认 → 设备 safe_sequence 仍是 0
 
 # 相同确认重复提交幂等（重试安全）：HTTP 200，status=duplicate
@@ -632,7 +650,9 @@ curl -s $DEV/archive-status
      "registered_at": "…"},
     {"consumer_id": "ml-pipeline", "watermark": 1, "first_gap": 2,
      "registered_at": "…"}
-  ]
+  ],
+  "archived_through": 0,
+  "archived_at": null
 }
 ```
 
@@ -641,12 +661,89 @@ curl -s $DEV/archive-status
 | `safe_sequence` | 所有必需消费者水位的最小值；可安全归档的连续前缀 `1..safe_sequence`。无消费者或任一消费者水位为 0 时为 `0` |
 | `first_gap` | 安全前缀之后的首个待归档序号（恒为 `safe_sequence + 1`） |
 | `blocking_consumers` | 水位等于该最小值且尚未追平链头的消费者（按编号排序）；全部追平或链上无批次时为空列表 |
-| `consumers[].watermark` | 该消费者从 1 起连续确认到的最大序号（乱序确认只填空缺，不越过首个缺口） |
-| `consumers[].first_gap` | 该消费者水位之后的首个缺口；已追平链头时为 `null` |
+| `consumers[].watermark` | 该消费者从 1 起连续确认到的最大序号（乱序确认只填空缺，不越过首个缺口）；归档之后才登记的消费者从 `archived_through` 起步 |
+| `consumers[].first_gap` | 该消费者水位之后的首个缺口；已追平链头时为 `null`；归档后新登记的消费者首个缺口为 `archived_through + 1` |
+| `archived_through` | 已归档连续前缀的右端序号（只进不退，初始 `0`） |
+| `archived_at` | 最近一次归档时刻（UTC ISO-8601）；从未归档为 `null` |
 
-归档作业只需轮询该接口并归档 `sequence <= safe_sequence` 的批次；`consumers`
-与 `blocking_consumers` 可用于定位卡在哪个处理方。确认记录与原批次始终保留，
-不做物理删除。
+归档作业轮询该接口并归档 `sequence <= safe_sequence` 的批次；`consumers`
+与 `blocking_consumers` 可用于定位卡在哪个处理方。确认记录始终保留；归档
+只清空批次明细载荷（见下节），不删除批次骨架。
+
+### 8. 归档连续前缀（清除已被全部必需消费者处理的明细载荷）
+
+当全部必需消费者都已确认某个连续前缀（`safe_sequence > archived_through`），
+设备可调用归档接口清空这些批次的明细载荷，回收存储：
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# 归档连续前缀 1..through_sequence（上例 safe_sequence=1）
+curl -s -X POST $DEV/archive -H 'Content-Type: application/json' \
+  -d '{"through_sequence": 1}'
+```
+
+```json
+{
+  "status": "archived",
+  "device_id": "dev-01",
+  "requested_through": 1,
+  "archived_through": 1,
+  "archived_at": "2026-10-01T06:00:00+00:00",
+  "newly_archived_count": 1,
+  "head_sequence": 2,
+  "safe_sequence": 1,
+  "first_gap": 2,
+  "blocking_consumers": ["ml-pipeline"],
+  "consumers": [ …同 archive-status… ]
+}
+```
+
+- **归档内容**：目标范围内批次的 `observations` 与四项阈值被清空，批次成为
+  墓碑（`status="archived"`、`archived=true`、带 `archived_at`），只保留
+  `batch_id`、`sequence`、`previous_digest`、`digest`、`observation_count`、
+  `created_at`、首次受理响应快照与 `replay_count` / `last_replayed_at`。
+  链头摘要、`batch_count` 与后续上传完全不变；
+- **越界冲突（409）**：`through_sequence` 不得超过**同一写事务内**核定的
+  `safe_sequence`。越界返回 409，`detail` 给出当前水位与阻塞消费者，作业
+  应等阻塞消费者追平后重试同一目标：
+
+```json
+{
+  "detail": {
+    "error": "archive_conflict",
+    "reason": "beyond_safe_sequence",
+    "message": "cannot archive through sequence 3: it exceeds safe_sequence 1 …",
+    "requested_through": 3,
+    "safe_sequence": 1,
+    "archived_through": 0,
+    "head_sequence": 2,
+    "first_gap": 2,
+    "blocking_consumers": ["ml-pipeline"]
+  }
+}
+```
+
+- **幂等**：重复相同目标或更小的目标返回 HTTP 200、
+  `status="already_archived"`，`archived_through` 与 `archived_at` 均不变，
+  `newly_archived_count=0`；归档水位**只进不退**；
+- **并发安全**：归档与批次确认、消费者登记、批次上传共用同一写锁串行点
+  （`BEGIN IMMEDIATE`）：并发确认不会让归档越过未确认批次，登记新消费者
+  后归档水位也不会越过它的水位；
+- **已归档批次仍可重放**：设备断网恢复后重发已归档批次，服务端按保存的
+  摘要判定——同载荷返回原结果（`status=replayed`）并原子累加
+  `replay_count`、刷新 `last_replayed_at`，墓碑与链头不变；载荷变化仍
+  返回 409（`reason=payload_changed`，附既有 `digest`）；
+- **已归档批次的确认幂等**：对墓碑批次以正确摘要确认返回 200
+  `duplicate`，错误摘要返回 409（`expected_digest` 仍可取自墓碑）；确认
+  不使任何水位回退；
+- **归档后登记的新消费者**：水位直接初始化为当前 `archived_through`，
+  无需逐个确认明细已清空的旧批次，其 `first_gap` 指向归档前缀的下一批；
+  它一旦落后链头，`safe_sequence` 会回落到其水位（但永不低于
+  `archived_through`），归档随之被挡住直到它追平。
+
+列表、详情、游标与 `archive-status` 均返回 `archived_through`；墓碑在列表
+与详情中均明确标注 `status="archived"`（另有布尔字段 `archived`）。
 
 ## 判定模型与裁决规则
 
@@ -697,7 +794,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 草稿回放共 85 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 草稿回放共 107 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -712,7 +809,8 @@ app/
   batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
   models.py  请求数据模型（Pydantic）
   db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
-             设备批次链 + 多消费者稀疏确认与安全归档水位，含首次迁移）
+             设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑，
+             含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库
